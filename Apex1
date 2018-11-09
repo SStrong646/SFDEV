@@ -1,0 +1,299 @@
+global class DisableUsersProcessor implements Messaging.InboundEmailHandler {
+//CHG0107981 - implement deactivation process into Engineered Fastening org.
+
+/*http://wiki.developerforce.com/page/An_Introduction_To_Email_Services_on_Force.com*/
+/*http://blog.jeffdouglas.com/2010/03/12/writing-an-inbound-email-service-for-salesforce-com/*/
+/*http://developer.force.com/cookbook/cookbookRecipeSource?id=a1V300000008uJOEAY*/
+
+/*The email we need to send to is:- disableusers@1iacfj1p2yfzqs7hizqovqruu6rdn9kw88tgbm8ejbu6shap10.a-bf5pmac.na7.apex.salesforce.com */
+@TestVisible private static list<Messaging.SingleEmailMessage> emails;
+private map<id, Database.SaveResult> deactivationFailures = new map<id, Database.SaveResult>();
+private static Database.SaveResult sr;
+private list<user> originalUserlist = new list<user>();
+
+global Messaging.InboundEmailResult handleInboundEmail(
+  Messaging.InboundEmail email,
+  Messaging.InboundEnvelope envelope)
+        {
+
+            string[] emailBody = email.PlainTextBody.split('\n', 0);
+
+            Map<String, String> uToDisable = new Map<String, String>();
+
+            //This handles the deactivation of the user and updates their record with the request Number
+            for(Integer i = 0; i < emailBody.size(); ++i){
+                String line = emailBody[i];
+                    if(line.contains('RITM') && i < emailBody.size() -2){
+                        i += 2; //this adds the line 2 along from the current one which is where the network ID is positioned in the table
+                        //DF: CHG0083960 - Fix for user deactivation process where users with no network ID would get deactivated if the users email received contained a user with no network ID - blank evaluated to blank!
+                        if(String.isNotBlank(emailBody[i])){
+                            System.debug(emailBody[i]);
+                            uToDisable.put(emailBody[i].toLowerCase(), line);
+                            }
+                        }
+            }
+
+            List<User> nID = new List<User>();
+            List<User> usersToDisable = new List<User>();
+
+
+            //get all of the IDs from salesforce where they exist in the outputs list
+            nID = [select id, federationIdentifier, isActive, FirstName, LastName, username, manager.name, userrole.name, manager.email, lastLoginDate, Market_Support__r.email, profileid
+            from User where federationIdentifier in: uToDisable.keyset() and isActive = true];
+
+            system.debug(nID + 'These are the matching network IDs');
+            for(User u: nID){
+                //might need to put date considerations here!
+                string request = uToDisable.get(u.federationIdentifier.toLowerCase());
+                u.req__c = request;
+                u.isActive = false;
+                usersToDisable.add(u);
+            }
+
+            if(!usersToDisable.isEmpty()){
+
+                //DF - CHG0078490 - Improvements in handling user deactivation if a user is unable to be deactivated
+                //This change allows the process to continue with any users that can be deactivated by using database.update
+                //It then sends an error email to notify users that the update failed.
+                Database.SaveResult[] lsr = Database.update(usersToDisable, false);
+
+                for(integer i = 0; i < usersToDisable.size(); i++){
+                    sr = lsr[i];
+                    User originalUser = usersToDisable[i];
+                    if(!sr.isSuccess()){
+                        system.debug('User ID = ' + originalUser.Id + ' ' + originalUser.firstName + ' ' + originalUser.lastName);
+                        system.debug('***THERE WERE THE FOLLOWING ERRORS***' + sr);
+                        //we need to send an error email here because at least one record failed to update
+
+                        originalUserList.add(originalUser);
+                        system.debug('ORIGINAL USER LIST' + originalUserList);
+                        deactivationFailures.put(originalUser.id, sr);
+                        system.debug('DEACTIVATION FAILURES MAP' + JSON.SerializePretty(deactivationFailures));
+                        //sendEmail(originalUserList, sr);
+                    }
+                }
+                if(!deactivationfailures.isEmpty()){
+                    sendEmail(originalUserList, deactivationFailures);
+                }
+
+
+                //we will need to get the email template and then send it as an email generated from Apex next... this is to replace the workflow method we had in place previously
+                //we don't need to pass the list down to this method because the trigger will take care of it...
+                //sendEmail(usersToDisable);
+            }
+
+            return null;
+        }
+        // Start DFCT0010531 by Evyatar
+        @future
+        public static void sendEmail(set<string> userIds){
+          sendEmail([ select id, federationIdentifier, isActive, FirstName, LastName, username, manager.name,
+                            userrole.name, manager.email, lastLoginDate, req__c, Market_Support__r.email, profileid
+                      from User
+                      where id in: userIds], null);
+        }//End DFCT0010531
+
+        public static void sendEmail(list<User> ud, map<id, database.saveResult> deactivationFailuresMap){
+            //http://salesforce.stackexchange.com/questions/1242/passing-custom-string-into-a-salesforce-email-template
+            //https://krishhari.wordpress.com/2013/09/03/dynamically-populating-custom-html-email-template-content-in-force-com-with-custom-dynamic-data-using-apex/
+            //http://salesforce.stackexchange.com/questions/32095/singlemessage-with-templateid-in-apex-need-to-add-more-recipients
+
+            system.debug('***** USERS IN LIST *****' + JSON.SerializePretty(ud));
+            //set the template name
+            string templateName = 'User_Deactivation';
+            //Set up the email.
+            /*list<Messaging.SingleEmailMessage>*/ emails = new List<Messaging.SingleEmailMessage>();
+
+            //Get the template
+
+            List<EmailTemplate> templates = [SELECT Id, Subject, HtmlValue, Markup, Body, developerName FROM EmailTemplate WHERE DeveloperName = :templateName and isActive = true];
+
+            if(!templates.isEmpty()){
+                EmailTemplate eTemplate = templates[0];
+                system.debug('***** EMAIL *****' + JSON.SerializePretty(eTemplate));
+
+                list<organization> o = [select primaryContact from organization];
+                string orgContactName = o[0].primaryContact;
+                string orgContactEmail = [select email from user where name = :orgContactName ].email;
+
+                 for(User u: ud){
+
+                    /*SET UP ALL OF THE EMAIL RECIPIENTS*/
+                    string[] toAddresses = new string[]{};
+                    string[] ccAddresses = new string[]{};
+                    string[] bccAddresses = new string[]{};
+
+                    //Add the manager to the recipients as well
+                    if(u.manager.email != null){
+                         //managerEmail = u.manager.email;
+                         toAddresses.add(u.manager.email);
+                    }
+                    //ADD THE MARKET SUPPORT EMAIL HERE - IT WILL NEED A NEW HIERARCHY FIELD ON THE USER OBJECT!
+                    if(u.Market_Support__c != null){
+                        toAddresses.add(u.market_support__r.email);
+                    }
+
+                    //set up the recipients (To, CC and BCC) based on the custom settings.
+                    /*THIS IS THE NEW SECTION DESIGNED TO WORK WITH DYNAMIC CUSTOM SETTINGS RECIPIENTS*/
+                    Deactivation_Recipients_Hierarchy__c recipProfile = Deactivation_Recipients_Hierarchy__c.getInstance(u.profileid);
+                    system.debug('PROFILE DEFAULT = ' + recipProfile);
+                    Deactivation_Recipients_Hierarchy__c recipUser = Deactivation_Recipients_Hierarchy__c.getInstance(u.id);
+                    system.debug('USER DEFAULT = ' + recipUser);
+                    Deactivation_Recipients_Hierarchy__c orgDefault = Deactivation_Recipients_Hierarchy__c.getOrgDefaults();
+                    system.debug('ORG DEFAULT = ' + orgDefault);
+
+                    set<string> toRecipients = new set<string>();
+                    set<string> ccRecipients = new set<string>();
+                    set<string> bccRecipients = new set<string>();
+
+                    toRecipients = PopulateEmailAddresses(recipProfile.To__c, recipUser.To__c, orgDefault.To__c);
+                    ccRecipients = PopulateEmailAddresses(recipProfile.CC__c, recipUser.CC__c, orgDefault.CC__c);
+                    bccRecipients = PopulateEmailAddresses(recipProfile.BCC__c, recipUser.BCC__c, orgDefault.BCC__c);
+
+                    //Check what is in the string array!
+                    system.debug('******' + JSON.SerializePretty(toRecipients));
+                    system.debug('******' + JSON.SerializePretty(ccRecipients));
+                    system.debug('******' + JSON.SerializePretty(bccRecipients));
+
+                if(!toRecipients.isEmpty()){
+                    toAddresses.addAll(toRecipients);
+                  }
+
+                if(toAddresses.isEmpty()){
+                    //we HAVE to have a To address - so in the event of there being nothing, we get the org contact address and send it to them.
+                  toAddresses.add(orgContactEmail);
+                }
+
+                if(!ccRecipients.isEmpty()){
+                  ccAddresses.addAll(ccRecipients);
+                }
+
+                if(!bccRecipients.isEmpty()){
+                  bccAddresses.addAll(bccRecipients);
+                }
+                 /*END OF NEW SECTION WHICH ADDS RECIPENTS FROM HIERARHCY CUSTOM SETTINGS*/
+                 system.debug(JSON.SerializePretty('TO ADDRESSES :' + toAddresses));
+                 system.debug(JSON.SerializePretty('CC ADDRESSES :' + ccAddresses));
+                 system.debug(JSON.SerializePretty('BCC ADDRESSES :' + bccAddresses));
+
+                    Messaging.SingleEmailMessage email = new Messaging.SingleEmailMessage();
+
+                    string subject = eTemplate.Subject;
+                    system.debug('SUBJECT = ' + subject);
+                    string htmlBody = eTemplate.Markup;
+                    system.debug('Org Name = ' + userInfo.getOrganizationName());
+                    system.debug('Org Id = ' + userInfo.getOrganizationId());
+                    system.debug('Context User = ' + userinfo.getName());
+
+                    email.setSubject('Salesforce User Deactivation Notification');
+
+                    /*Use the isSandbox boolean to determine if it is a sandbox we are working in! (introduced with Summer 14)*/
+                    /*https://developer.salesforce.com/forums/?id=906F0000000AeBmIAK*/
+
+                    Organization org = [select isSandbox from Organization];
+
+                    //Replace the merge fields!
+                    if(!org.isSandbox){
+                        htmlBody = htmlBody.replace('{ENVIRONMENT_REPLACE}', 'PRODUCTION');
+                    }else{
+                        htmlBody = htmlBody.replace('{ENVIRONMENT_REPLACE}', '<p style="color:#DF0101;">SANDBOX</p>');
+                    }
+                    if(deactivationfailuresMap != null && deactivationFailuresMap.get(u.id) != null){
+                        email.setSubject('***ERROR*** Salesforce User Deactivation Notification');
+                        //populate the template with the error string instead of the "normal" sucess message
+                        htmlBody = htmlBody.replace('The following user in Org: {ORGNAME_REPLACE} with Org ID: ({ORGID_REPLACE}) has been deactivated by {CONTEXT_NAME_REPLACE}', 'The following user in Org: {ORGNAME_REPLACE} with Org ID: ({ORGID_REPLACE}) failed to deactivate by {CONTEXT_NAME_REPLACE} with the following error: <br /><br /><b>' + deactivationFailuresMap.get(u.id) + '</b>');
+                        htmlBody = htmlBody.replace('Consider reallocating company records, contacts, opportunities etc for the deactivated user. Click the link below to view current data storage usage for this user.', '');
+                        // this will change the css styling to have a red background!
+                        htmlBody = htmlBody.replace('#01a3d6;','#DF0101;');
+                        //replace the link to the storage with nothing as there was an error deactivating the user...
+                        htmlBody = htmlBody.replace('{URL_REPLACE}', '');
+                    }else{
+                        htmlBody = htmlBody.replace('{URL_REPLACE}', URL.getSalesforceBaseUrl().toExternalForm() + '/setup/user/userstorageusage.jsp?id=' + u.id);
+                    }
+                    htmlBody = htmlBody.replace('{ORGNAME_REPLACE}', UserInfo.getOrganizationName()); //Org Name
+                    htmlBody = htmlBody.replace('{ORGID_REPLACE}', UserInfo.getOrganizationId()); // Org Id
+                    htmlBody = htmlBody.replace('{CONTEXT_NAME_REPLACE}', UserInfo.getName()); // Context username
+                    htmlBody = htmlBody.replace('{RELATEDTO_ID_URL_REPLACE}', URL.getSalesforceBaseUrl().toExternalForm() + '/' + u.id);
+                    htmlBody = htmlBody.replace('{RELATEDTO_ID_REPLACE}', u.id);
+                    system.debug('User id is = ' + u.id);
+                    htmlBody = htmlBody.replace('{RELATEDTO_FIRSTNAME_REPLACE}',u.FirstName);
+                    system.debug('First name = ' + u.FirstName);
+                    htmlBody = htmlBody.replace('{RELATEDTO_LASTNAME_REPLACE}',u.LastName);
+                    system.debug('Last name = ' + u.LastName);
+                    htmlBody = htmlBody.replace('{RELATEDTO_USERNAME_REPLACE}', u.Username);
+                    system.debug('Username = ' + u.Username);
+                    if(u.manager.name != null){
+                        htmlBody = htmlBody.replace('{RELATEDTO_MANAGER_NAME_REPLACE}', u.manager.name);
+                        system.debug('Manager name = ' + u.manager.name);
+                    }else{
+                        htmlBody = htmlBody.replace('{RELATEDTO_MANAGER_NAME_REPLACE}', '');
+                    }
+                    if(u.userrole.name != null){
+                        htmlBody = htmlBody.replace('{RELATEDTO_USERROLE_REPLACE}', u.userrole.name);
+                    }else{
+                        //role is not mandatory so there is a possibility that the user might not have one assigned!
+                        htmlBody = htmlBody.replace('{RELATEDTO_USERROLE_REPLACE}', '');
+                    }
+                    system.debug('User role = ' + u.userrole.name);
+                    if(u.req__c != null){
+                        htmlBody = htmlBody.replace('{RELATEDTO_REQ_REPLACE}', u.req__c);
+                        system.debug('Req No = ' + u.req__c);
+                    }else{
+                        htmlBody = htmlBody.replace('{RELATEDTO_REQ_REPLACE}', '');
+                    }
+
+                    if(u.LastLoginDate != NULL){
+                        //They might never have logged in!
+                        htmlBody = htmlBody.replace('{RELATEDTO_LASTLOGIN_REPLACE}', u.LastLoginDate.format('dd MMM yyyy HH:mm:ss z'));
+                        //htmlBody = htmlBody.replace('<apex:outputText id="lastLogin" value="{0,date,dd MMM yyyy \'at\' HH:mm:ss z}">', '<apex:outputText id="lastLogin">' + u.LastLoginDate.format('dd MMM yyyy HH:mm:ss z'));
+                        //htmlBody = htmlBody.replace('<apex:param value="{!relatedTo.LastLoginDate}"/>', '');
+                        system.debug('LAST LOGIN DATE = ' + u.LastLoginDate.format('dd MMM yyyy : HH:mm:ss z'));
+                    }else{
+                        htmlBody = htmlBody.replace('{RELATEDTO_LASTLOGIN_REPLACE}', '');
+                        //htmlBody = htmlBody.replace('{!relatedTo.LastLoginDate}', '');
+                    }
+                    dateTime currentTime = dateTime.now();
+                    system.debug('CURRENT TIME IS = ' + currentTime);
+                    htmlBody = htmlBody.replace('{TIMENOW_REPLACE}', currentTime.format('dd MMM yyyy : HH:mm:ss z'));
+                    //htmlBody = htmlBody.replace('<apex:outputText id="dateTimeNow" value="{0,date,dd MMM yyyy \'at\' HH:mm:ss z}">', '<apex:outputText id="dateTimeNow">' + currentTime.format('dd MMM yyyy : HH:mm:ss z'));
+                    //htmlBody = htmlBody.replace('<apex:param value="{!NOW()}"/>', '');
+
+                    //htmlBody = htmlBody.replace('{!LEFT($Api.Partner_Server_URL_280, FIND(\".com/\",$Api.Partner_Server_URL_280)+3)}/setup/user/userstorageusage.jsp?id={!relatedTo.Id}', URL.getSalesforceBaseUrl().toExternalForm() + '/setup/user/userstorageusage.jsp?id=' + u.id);
+
+                    system.debug('***** CONTENTS OF EMAIL *****' + htmlBody);
+                    //email.setCcAddresses(new string[] {'laurence.hall@sbdinc.com'});
+                    if(ccAddresses != null){
+                        email.setCcAddresses(ccAddresses);
+                    }
+                    if(bccAddresses != null){
+                        email.setbccAddresses(bccAddresses);
+                    }
+                    email.setToAddresses(toAddresses);
+
+                    //For some weird reason the subject being returned in the query is NULL - it is clearly set in the template but has stopped working for some bizarre reason.
+                    //Hard coding for now!!!
+                    //email.setSubject(subject);
+
+                    email.setHtmlBody(htmlBody);
+
+                    //Messaging.sendEmail(new Messaging.SingleEmailmessage[] {email});
+                    emails.add(email);
+                }
+                Messaging.sendEmail(emails);
+
+            }
+        }
+
+        private static set<string> PopulateEmailAddresses(string mailAdds1, string mailAdds2, string mailAdds3){
+
+            set<string> addresses = new set<string>();
+            addresses.add(mailAdds1);
+            addresses.add(mailAdds2);
+            addresses.add(mailAdds3);
+
+            addresses.remove(null);
+
+            return addresses;
+        }
+
+}
